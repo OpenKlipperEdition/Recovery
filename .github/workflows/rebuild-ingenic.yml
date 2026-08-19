@@ -1,0 +1,103 @@
+name: Rebuild Ingenic package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out package template
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Resolve latest published NebulaOS release
+        id: resolve_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_json="$(mktemp)"
+          trap 'rm -f "$release_json"' EXIT
+          curl --fail --location --retry 3 --retry-delay 2 --show-error \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/coreflake1/NebulaOS/releases?per_page=100" \
+            --output "$release_json"
+
+          latest_release_filter='[.[] | select(.draft == false and .published_at != null)] | sort_by(.published_at) | last'
+          release_count="$(jq -er "${latest_release_filter} | if . == null then 0 else 1 end" "$release_json")"
+          if [ "$release_count" -eq 0 ]; then
+            echo "::error::NebulaOS has no published releases. Create a release containing xImage and rootfs.squashfs first."
+            exit 1
+          fi
+
+          release_tag="$(jq -er "${latest_release_filter} | .tag_name | select(type == \"string\" and length > 0)" "$release_json")"
+          root2_url="$(jq -er "${latest_release_filter} | [.assets[] | select(.name == \"rootfs.squashfs\") | .browser_download_url] | select(length == 1) | .[0]" "$release_json")"
+          kernel2_url="$(jq -er "${latest_release_filter} | [.assets[] | select(.name == \"xImage\") | .browser_download_url] | select(length == 1) | .[0]" "$release_json")"
+          safe_tag="$(printf '%s' "$release_tag" | sed 's/[^A-Za-z0-9._-]/-/g')"
+          package_name="Ender-3_V3_KE_1.1.0.12-${safe_tag}.ingenic"
+
+          {
+            echo "release_tag=$release_tag"
+            echo "root2_url=$root2_url"
+            echo "kernel2_url=$kernel2_url"
+            echo "package_name=$package_name"
+          } >> "$GITHUB_OUTPUT"
+          echo "Using NebulaOS release: $release_tag"
+          echo "Output package: $package_name"
+
+      - name: Download root2 and kernel2
+        env:
+          ROOT2_URL: ${{ steps.resolve_release.outputs.root2_url }}
+          KERNEL2_URL: ${{ steps.resolve_release.outputs.kernel2_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          curl --fail --location --retry 3 --retry-delay 2 --show-error \
+            "$ROOT2_URL" --output build/root2.squashfs
+          curl --fail --location --retry 3 --retry-delay 2 --show-error \
+            "$KERNEL2_URL" --output build/kernel2
+          test -s build/root2.squashfs
+          test -s build/kernel2
+
+      - name: Rebuild .ingenic package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 scripts/rebuild_ingenic.py \
+            Ender-3_V3_KE_1.1.0.12.ingenic \
+            "dist/${{ steps.resolve_release.outputs.package_name }}" \
+            --root2 build/root2.squashfs \
+            --kernel2 build/kernel2
+
+      - name: Upload rebuilt package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ender-3_V3_KE-ingenic
+          path: dist/${{ steps.resolve_release.outputs.package_name }}
+          if-no-files-found: error
+
+      - name: Publish rebuilt package to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.resolve_release.outputs.release_tag }}
+          PACKAGE_PATH: dist/${{ steps.resolve_release.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          release_title="NebulaOS dual-slot recovery ${RELEASE_TAG}"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$PACKAGE_PATH" --clobber
+            gh release edit "$RELEASE_TAG" --title "$release_title"
+          else
+            gh release create "$RELEASE_TAG" "$PACKAGE_PATH" \
+              --title "$release_title" \
+              --notes "Rebuilt dual-slot Ingenic recovery package."
+          fi
